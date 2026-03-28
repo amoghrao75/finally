@@ -66,7 +66,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Backend**: FastAPI (Python), managed as a `uv` project
 - **Database**: SQLite, single file at `db/finally.db`, volume-mounted for persistence
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
-- **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
+- **AI integration**: OpenRouter (free model) via the `openai` Python SDK, with structured outputs for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
 
 ### Why These Choices
@@ -171,6 +171,10 @@ Both the simulator and the Massive client implement the same abstract interface.
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
+### Ticker Lifecycle
+
+When a ticker is added to or removed from the watchlist (via the REST API or an LLM action), the backend calls `add_ticker()` / `remove_ticker()` on the active market data source. The simulator immediately begins generating prices for the new ticker; the Massive poller includes it in its next poll cycle. Removal stops price generation and clears the ticker from the price cache.
+
 ### SSE Streaming
 
 - Endpoint: `GET /api/stream/prices`
@@ -211,7 +215,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
-- `quantity` REAL (fractional shares supported)
+- `quantity` REAL (fractional shares supported, minimum 0.01)
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
@@ -221,11 +225,11 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
-- `quantity` REAL (fractional shares supported)
+- `quantity` REAL (fractional shares supported, minimum 0.01)
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. A cleanup task runs on startup and every 10 minutes, keeping only the most recent 500 snapshots and deleting older rows.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -270,6 +274,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 ### Chat
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/api/chat/history` | Retrieve recent chat messages (last 50), ordered oldest-first |
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
 
 ### System
@@ -281,22 +286,20 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
-
-There is an OPENROUTER_API_KEY in the .env file in the project root.
+The backend calls OpenRouter directly using the `openai` Python SDK (`base_url="https://openrouter.ai/api/v1"`) with `OPENROUTER_API_KEY` from the `.env` file. Use a free model available on OpenRouter (e.g., `meta-llama/llama-4-maverick:free` or whatever free model best supports structured JSON output at build time). No LiteLLM dependency.
 
 ### How It Works
 
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads recent conversation history from the `chat_messages` table (last 20 messages to fit within context limits)
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the LLM via the `openai` SDK pointed at OpenRouter, requesting structured JSON output
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
-8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+8. Returns the complete JSON response to the frontend (no token-by-token streaming — a loading indicator is sufficient)
 
 ### Structured Output Schema
 
@@ -454,3 +457,18 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Decisions (2026-03-28)
+
+The following decisions were made during the doc review and are now reflected in the plan above:
+
+- **Dropped LiteLLM.** OpenRouter is called directly via the `openai` Python SDK. No LiteLLM dependency. (Sections 3, 9)
+- **Free OpenRouter model.** Use a free model on OpenRouter for chat inference. (Section 9)
+- **Chat history endpoint added.** `GET /api/chat/history` returns the last 50 messages. LLM context uses last 20. (Sections 8, 9)
+- **Snapshot retention.** Cleanup task keeps the most recent 500 snapshots. (Section 7)
+- **Fractional shares minimum.** Minimum trade quantity is 0.01 shares. (Section 7)
+- **Ticker lifecycle clarified.** Watchlist changes trigger `add_ticker`/`remove_ticker` on the market data source. (Section 6)
+- **`.env.example` committed.** `.env` is gitignored; `.env.example` with placeholders is committed. (Done)
+- **Frontend directory** does not exist yet — it is next in the build sequence.
